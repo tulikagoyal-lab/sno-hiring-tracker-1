@@ -1,6 +1,8 @@
 streamlit
 pandas
 plotly
+narwhals
+packaging
 openpyxl
 gspread
 oauth2client
