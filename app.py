@@ -17,27 +17,37 @@ warnings.filterwarnings("ignore")
 def get_snowflake_conn():
     try:
         import snowflake.connector
-        token = None
-        account = None
-        warehouse = None
-        role = None
+        sf = None
         try:
             sf = st.secrets["snowflake"]
-            token = sf["access_token"]
-            account = sf.get("account", "GZAVXAB-SWIGGY_MUMBAI")
-            warehouse = sf.get("warehouse", "NONTECH_WH_01")
-            role = sf.get("role", "DRIVERS_ORG")
         except:
-            token = os.environ.get("SNOWFLAKE_ACCESS_TOKEN", "")
-            account = os.environ.get("SNOWFLAKE_ACCOUNT", "GZAVXAB-SWIGGY_MUMBAI")
-            warehouse = "NONTECH_WH_01"
-            role = os.environ.get("SNOWFLAKE_ROLE", "DRIVERS_ORG")
-        if not token:
+            pass
+        if sf is None:
             return None
-        conn = snowflake.connector.connect(
-            account=account, authenticator="oauth", token=token,
-            warehouse=warehouse, role=role,
-        )
+        account = sf.get("account", "GZAVXAB-SWIGGY_MUMBAI")
+        warehouse = sf.get("warehouse", "NONTECH_WH_01")
+        role = sf.get("role", "DRIVERS_ORG")
+        user = sf.get("user", "")
+        private_key = sf.get("private_key", "")
+        if private_key:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.backends import default_backend
+            key_bytes = private_key.encode() if isinstance(private_key, str) else private_key
+            pkb = serialization.load_pem_private_key(
+                key_bytes, password=None, backend=default_backend()
+            )
+            conn = snowflake.connector.connect(
+                account=account, user=user, private_key=pkb,
+                warehouse=warehouse, role=role,
+            )
+        else:
+            token = sf.get("access_token", "")
+            if not token:
+                return None
+            conn = snowflake.connector.connect(
+                account=account, authenticator="oauth", token=token,
+                warehouse=warehouse, role=role,
+            )
         cur = conn.cursor()
         cur.execute(f"USE WAREHOUSE {warehouse}")
         return conn
@@ -103,18 +113,17 @@ def fetch_orders_from_snowflake(d1, d2):
     and dt between '{d1}' and '{d2}'
     ) group by all order by city_name
     )
-    select City_Type, fleet, sum(orders) as total_orders
-    from cte group by 1, 2 order by 1, 2
+    select City_Type, sum(orders) as total_orders
+    from cte where fleet = 'IM' group by 1 order by 1
     """
     try:
         cur = conn.cursor()
         cur.execute(query)
         rows = cur.fetchall()
-        results = {"SNO_Food": 0, "SNO_IM": 0, "SOC_Food": 0, "SOC_IM": 0, "SNO_Total": 0, "SOC_Total": 0}
+        results = {"SNO_IM": 0, "SOC_IM": 0}
         for row in rows:
-            ct, fl, od = row[0], row[1], int(row[2])
-            results[f"{ct}_{fl}"] = od
-            results[f"{ct}_Total"] += od
+            ct, od = row[0], int(row[1])
+            results[f"{ct}_IM"] = od
         return results
     except Exception as e:
         st.error(f"Query failed: {e}")
@@ -219,12 +228,8 @@ def write_submission(channel, week_label, data):
 def write_orders_to_sheet(week_label, orders_data):
     channel = "Auto-Fetch (Orders)"
     data = {
-        "orders_sno": float(orders_data.get("SNO_Total", 0)),
-        "orders_soc": float(orders_data.get("SOC_Total", 0)),
-        "orders_sno_food": float(orders_data.get("SNO_Food", 0)),
-        "orders_sno_im": float(orders_data.get("SNO_IM", 0)),
-        "orders_soc_food": float(orders_data.get("SOC_Food", 0)),
-        "orders_soc_im": float(orders_data.get("SOC_IM", 0)),
+        "orders_sno": float(orders_data.get("SNO_IM", 0)),
+        "orders_soc": float(orders_data.get("SOC_IM", 0)),
     }
     return write_submission(channel, week_label, data)
 
@@ -432,6 +437,14 @@ def submission_form():
     st.markdown(f"### {wl} ({wsd.strftime('%d %b %Y')})")
     if cd is None: st.error("Channel not found."); return
 
+    # Auto-fetch orders from Snowflake for pre-fill
+    d1, d2 = get_last_week_dates()
+    orders = fetch_orders_from_snowflake(d1, d2)
+    defaults = {}
+    if orders:
+        defaults["orders_sno"] = str(orders.get("SNO_IM", 0))
+        defaults["orders_soc"] = str(orders.get("SOC_IM", 0))
+
     with st.form("cf"):
         data = {}
         for sec, keys in cd["sections"].items():
@@ -440,7 +453,8 @@ def submission_form():
                 for i, mk in enumerate(keys):
                     label = METRIC_LABELS.get(mk, mk.replace("_", " ").title())
                     with cols[i % 3]:
-                        data[mk] = st.text_input(label, placeholder="0", key=f"f_{mk}")
+                        dv = defaults.get(mk, "")
+                        data[mk] = st.text_input(label, value=dv, placeholder="0", key=f"f_{mk}")
         if st.form_submit_button("Submit", type="primary", use_container_width=True):
             clean = {}
             for k, v in data.items():
@@ -494,12 +508,10 @@ def admin_dashboard():
 
     if "fo" in st.session_state:
         fo = st.session_state["fo"]
-        cols = st.columns(4)
-        for i, (l, v) in enumerate([("SNO Food", fo.get("SNO_Food", 0)), ("SNO IM", fo.get("SNO_IM", 0)),
-                                      ("SOC Food", fo.get("SOC_Food", 0)), ("SOC IM", fo.get("SOC_IM", 0))]):
+        cols = st.columns(2)
+        for i, (l, v) in enumerate([("SNO IM", fo.get("SNO_IM", 0)), ("SOC IM", fo.get("SOC_IM", 0))]):
             with cols[i]:
                 st.markdown(f'<div class="metric-card"><div class="metric-label">{l}</div><div class="metric-value">{v:,}</div></div>', unsafe_allow_html=True)
-        st.markdown(f"**SNO Total:** {fo.get('SNO_Total',0):,} | **SOC Total:** {fo.get('SOC_Total',0):,}")
 
     st.markdown("---")
 
