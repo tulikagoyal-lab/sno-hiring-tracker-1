@@ -454,7 +454,8 @@ def submission_form():
                     label = METRIC_LABELS.get(mk, mk.replace("_", " ").title())
                     with cols[i % 3]:
                         dv = defaults.get(mk, "")
-                        data[mk] = st.text_input(label, value=dv, placeholder="0", key=f"f_{mk}")
+                        is_order = mk in ("orders_sno", "orders_soc")
+                        data[mk] = st.text_input(label, value=dv, placeholder="0", key=f"f_{mk}", disabled=is_order)
         if st.form_submit_button("Submit", type="primary", use_container_width=True):
             clean = {}
             for k, v in data.items():
