@@ -3,171 +3,404 @@ import pandas as pd
 import hashlib
 from datetime import datetime, timedelta
 import plotly.express as px
-import plotly.graph_objects as go
 import warnings
+import json
+import os
 
 warnings.filterwarnings("ignore")
 
-# ── Simple Auth ──
-USERS = {
-    "Tulika": {"hash": hashlib.sha256("admin123".encode()).hexdigest()[:12], "admin": True},
-    "SOC Channel": {"hash": hashlib.sha256("soc123".encode()).hexdigest()[:12], "admin": False},
-    "SNO Channel": {"hash": hashlib.sha256("sno123".encode()).hexdigest()[:12], "admin": False},
-    "Agency Channel": {"hash": hashlib.sha256("agency123".encode()).hexdigest()[:12], "admin": False},
-    "Google Channel": {"hash": hashlib.sha256("google123".encode()).hexdigest()[:12], "admin": False},
-    "Referral Channel": {"hash": hashlib.sha256("ref123".encode()).hexdigest()[:12], "admin": False},
-    "FR Channel": {"hash": hashlib.sha256("fr123".encode()).hexdigest()[:12], "admin": False},
+# ═════════════════════════════════════════════════════
+# Snowflake Connection
+# ═════════════════════════════════════════════════════
+
+@st.cache_resource(ttl=300)
+def get_snowflake_conn():
+    try:
+        import snowflake.connector
+        token = None
+        account = None
+        warehouse = None
+        role = None
+        try:
+            sf = st.secrets["snowflake"]
+            token = sf["access_token"]
+            account = sf.get("account", "GZAVXAB-SWIGGY_MUMBAI")
+            warehouse = sf.get("warehouse", "NONTECH_WH_01")
+            role = sf.get("role", "DRIVERS_ORG")
+        except:
+            token = os.environ.get("SNOWFLAKE_ACCESS_TOKEN", "")
+            account = os.environ.get("SNOWFLAKE_ACCOUNT", "GZAVXAB-SWIGGY_MUMBAI")
+            warehouse = "NONTECH_WH_01"
+            role = os.environ.get("SNOWFLAKE_ROLE", "DRIVERS_ORG")
+        if not token:
+            return None
+        conn = snowflake.connector.connect(
+            account=account, authenticator="oauth", token=token,
+            warehouse=warehouse, role=role,
+        )
+        cur = conn.cursor()
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        return conn
+    except Exception as e:
+        st.warning(f"Snowflake: {e}")
+        return None
+
+@st.cache_data(ttl=3600)
+def fetch_orders_from_snowflake(d1, d2):
+    conn = get_snowflake_conn()
+    if conn is None:
+        return None
+    query = f"""
+    with cte as(
+    select dt, city_name, order_flag, count(distinct order_id) orders,
+    case when order_flag = 'Instamart' then 'IM' else 'Food' end as fleet,
+    case when city_name in ('Chennai','Ahmedabad','Hyderabad','Delhi','Bangalore','Mumbai','Vijayawada','Indore','Jaipur','Noida','Kochi','Kolkata','Lucknow','Thiruvananthapuram','Madurai','Pune','Central Goa','Gorakhpur','Kanpur','Pondicherry','Surat','Bhubaneswar','Vizag','Mysore','Noida 1','Dehradun','Guwahati','Tirupur','Chandigarh','Faridabad','Gurgaon','Manipal','Coimbatore','Thrissur','Patna','Vadodara','Rajkot','Agra','Varanasi','Amritsar','Mangaluru','Ludhiana','Raipur') then 'SNO' else 'SOC' end as City_Type
+    from (
+    select distinct order_id, case when POST_STATUS in ('Completed') then 'Completed' else 'Cancelled' end POST_STATUS,
+    ORDERED_TIME, m.city_id::varchar as city_id, c.name city_name,
+    (case when lower(delivery_partner) in ('rapido','shadowfax','loadshare','adloggs') then 'SFX_Food'
+    when lower(delivery_partner) in ('dominos','petpooja','urbanpiper','faasos','eatclub','popeyes') then 'Dominos_Food'
+    else 'Food' end) Order_Flag, dt
+    from facts.public.dp_order_fact m
+    left join de.swiggy.area a on a.id=m.area_id
+    left join de.swiggy.zone z on z.id=a.zone_id
+    left join de.swiggy.city c on c.id=z.city_id
+    where to_date(dt) between '{d1}' and '{d2}'
+    and restaurant_id not in (select distinct restaurant_id from analytics.public.restaurant_attributes
+    where (business_classifier='Stores Lite' or parent_id in ('591159')))
+    and lower(post_status)='completed' and ignore_order_flag=0
+    group by all
+    union all
+    select distinct a.order_id, case when status in ('DELIVERY_DELIVERED') then 'Completed' else 'Cancelled' end POST_STATUS,
+    a.ORDERED_TIME, a.CITY_ID, a.city, 'Instamart' ORDER_FLAG, a.dt
+    from analytics.public.IM_PARENT_ORDER_FACT a
+    where a.status='DELIVERY_DELIVERED' and a.dt between '{d1}' and '{d2}'
+    group by all
+    union all
+    select distinct id order_id, case when status in ('DELIVERY_DELIVERED') then 'Completed' else 'Cancelled' end POST_STATUS,
+    ORDERED_TIME, city_id::varchar city_id, city,
+    (case when lower(type) in ('instamart') and lower(city) not in ('budhwal') then 'Instamart'
+    when lower(CATEGORY) ilike '%liquor%' then 'Alcohol' else 'stores' end) order_flag, dt
+    from ANALYTICS.PUBLIC.STORES_ORDER_FACT
+    where dt between '{d1}' and '{d2}' and lower(CATEGORY) ilike '%liquor%' and status in ('DELIVERY_DELIVERED')
+    union all
+    select distinct id order_id, case when status in ('DELIVERY_DELIVERED') then 'Completed' else 'Cancelled' end POST_STATUS,
+    ORDERED_TIME, city_id::varchar city_id, city,
+    (case when ORDER_TYPE is not null then 'Genie' end) order_flag, dt
+    from ANALYTICS.PUBLIC.GENIE_ORDER_FACT
+    where dt between '{d1}' and '{d2}' and status in ('DELIVERY_DELIVERED')
+    union all
+    select distinct id order_id, case when status in ('DELIVERY_DELIVERED') then 'Completed' else 'Cancelled' end POST_STATUS,
+    ORDERED_TIME, city_id::varchar city_id, city,
+    (case when SID is not null then 'Genie' end) order_flag, dt
+    from ANALYTICS.PUBLIC.GENIE_B2B_ORDER_FACT
+    where dt between '{d1}' and '{d2}' and status in ('DELIVERY_DELIVERED')
+    union all
+    select order_id, ORDER_STATUS POST_STATUS, ordered_time, a.city_id, b.name city, 'Snacc' ORDER_FLAG, to_date(dt) dt
+    from ANALYTICS.PUBLIC.SNACC_ORDER_FACT a
+    left join de.swiggy.city b on a.city_id=b.id
+    where lower(CATEGORY) in ('snacc') and lower(ORDER_STATUS) in ('completed')
+    and dt between '{d1}' and '{d2}'
+    ) group by all order by city_name
+    )
+    select City_Type, fleet, sum(orders) as total_orders
+    from cte group by 1, 2 order by 1, 2
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        rows = cur.fetchall()
+        results = {"SNO_Food": 0, "SNO_IM": 0, "SOC_Food": 0, "SOC_IM": 0, "SNO_Total": 0, "SOC_Total": 0}
+        for row in rows:
+            ct, fl, od = row[0], row[1], int(row[2])
+            results[f"{ct}_{fl}"] = od
+            results[f"{ct}_Total"] += od
+        return results
+    except Exception as e:
+        st.error(f"Query failed: {e}")
+        return None
+    finally:
+        try: cur.close()
+        except: pass
+
+def get_last_week_dates():
+    today = datetime.now()
+    lm = today - timedelta(days=today.weekday() + 7)
+    ls = lm + timedelta(days=6)
+    return lm.strftime("%Y-%m-%d"), ls.strftime("%Y-%m-%d")
+
+# ═════════════════════════════════════════════════════
+# Google Sheets
+# ═════════════════════════════════════════════════════
+
+SHEET_ID = "116n7chDnpyh14Z4TTL7jEBRG1XoYDGzE_O01JCI6iPc"
+SHEET_GID = "37744413"
+
+@st.cache_resource
+def get_gsheet_client():
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+        creds_dict = st.secrets["gcp_service_account"]
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(creds_dict), scope)
+        return gspread.authorize(creds)
+    except:
+        return None
+
+def get_sheet():
+    client = get_gsheet_client()
+    if client is None:
+        return None
+    try:
+        sheet = client.open_by_key(SHEET_ID)
+        try:
+            return sheet.get_worksheet_by_id(int(SHEET_GID))
+        except:
+            return sheet.sheet1
+    except:
+        return None
+
+def read_all_submissions():
+    ws = get_sheet()
+    if ws is None:
+        return []
+    records = ws.get_all_records()
+    subs = []
+    for row in records:
+        for mk, val in row.items():
+            if mk in ["channel", "week_label", "submitted_at"]:
+                continue
+            try:
+                v = float(val) if val and str(val).strip() != "" else 0.0
+            except:
+                v = 0.0
+            if v != 0:
+                subs.append({"channel": row.get("channel", ""), "week_label": row.get("week_label", ""),
+                            "metric": mk, "value": v})
+    return subs
+
+def write_submission(channel, week_label, data):
+    ws = get_sheet()
+    if ws is None:
+        st.error("Google Sheets not connected.")
+        return False
+    try:
+        all_records = ws.get_all_records()
+        headers = ws.row_values(1)
+        all_keys = sorted(set(data.keys()))
+        expected = ["channel", "week_label", "submitted_at"] + all_keys
+        if set(expected) != set(headers) or not headers:
+            ws.clear()
+            ws.append_row(expected)
+            headers = expected
+
+        row_idx = None
+        for i, rec in enumerate(all_records):
+            if rec.get("channel") == channel and rec.get("week_label") == week_label:
+                row_idx = i + 2
+                break
+
+        now = datetime.now().isoformat()
+        row_data = {"channel": channel, "week_label": week_label, "submitted_at": now}
+        row_data.update(data)
+        row_list = [row_data.get(h, "") for h in headers]
+
+        if row_idx:
+            for ci, val in enumerate(row_list):
+                ws.update_cell(row_idx, ci + 1, val)
+        else:
+            ws.append_row(row_list)
+        return True
+    except Exception as e:
+        st.error(f"Sheet error: {e}")
+        return False
+
+def write_orders_to_sheet(week_label, orders_data):
+    channel = "Auto-Fetch (Orders)"
+    data = {
+        "orders_sno": float(orders_data.get("SNO_Total", 0)),
+        "orders_soc": float(orders_data.get("SOC_Total", 0)),
+        "orders_sno_food": float(orders_data.get("SNO_Food", 0)),
+        "orders_sno_im": float(orders_data.get("SNO_IM", 0)),
+        "orders_soc_food": float(orders_data.get("SOC_Food", 0)),
+        "orders_soc_im": float(orders_data.get("SOC_IM", 0)),
+    }
+    return write_submission(channel, week_label, data)
+
+# ═════════════════════════════════════════════════════
+# Channel Definitions
+# ═════════════════════════════════════════════════════
+
+CHANNELS = {
+    "SNO Channel": {
+        "passcode": "sno123",
+        "sections": {
+            "Orders (SNO)": ["orders_sno"],
+            "SNO Hiring": ["sno_spillover_28", "sno_cpfod_ref", "sno_cpfod_rb_override", "sno_cpfod_agency", "sno_rejoiner"],
+            "SNO Absolute Cost": [
+                "cost_flatpay", "cost_leakage", "cost_shouldering", "cost_dormant_rb",
+                "cost_impersonation", "cost_jb", "cost_rb_cpfod", "cost_rb_fod",
+                "cost_ref_override_cpfod", "cost_ref_override_fod", "cost_spillover_28",
+                "cost_agency", "cost_google_supper", "cost_google_extra", "cost_google_fresh_fod",
+                "cost_google_im_app", "cost_google_im_1st", "cost_google_extra_1st",
+                "cost_upfront_fee", "cost_insurance", "cost_ob_fee",
+                "cost_apsflyer", "cost_pivot_roots", "cost_autodialer",
+                "cost_bgv_fresh", "cost_bgv_address", "cost_bgv_rejoiner",
+                "cost_sms_fresh", "cost_sms_rejoiner",
+                "cost_whatsapp_fresh", "cost_whatsapp_rejoiner",
+                "cost_obe_rtc", "cost_fr_salary", "cost_fr_count",
+                "cost_fr_tl_salary", "cost_fr_tl_count", "cost_btl",
+                "cost_fr_incentive", "cost_influencer_payout",
+                "cost_inf_tl_salary", "cost_inf_tl_count",
+                "cost_spillover_over_28", "cost_other_mult", "cost_other_val",
+            ],
+            "SNO Same Week Transacting": ["transact_ref", "transact_google", "transact_affiliate", "transact_ssu", "transact_fr", "transact_agency", "transact_influencers"],
+            "SNO Spill Over FOD": ["spill_fod_ref", "spill_fod_google", "spill_fod_affiliate", "spill_fod_ssu", "spill_fod_fr", "spill_fod_agency", "spill_fod_influencers"],
+            "SNO Onboarding": ["onboard_ref", "onboard_google", "onboard_affiliate", "onboard_ssu", "onboard_fr", "onboard_agency", "onboard_influencers"],
+        }
+    },
+    "SOC Channel": {
+        "passcode": "soc123",
+        "sections": {
+            "Orders (SOC)": ["orders_soc"],
+            "SOC Hiring": ["soc_fresh_onboard", "soc_rejoiner", "soc_spillover_28", "soc_spillover_over_28"],
+            "SOC CPH": ["soc_cpod_ref"],
+            "SOC Absolute Cost": [
+                "soc_rejoiner_cost", "soc_jb_cost", "soc_rb_cpfod", "soc_cost_spillover_28",
+                "soc_cost_spillover_over_28", "soc_jb_adjust", "soc_rb_adjust",
+                "soc_agency_cost", "soc_google_im", "soc_google_supper",
+                "soc_google_im_sa_fod", "soc_google_sf_sa_fod", "soc_extra_im",
+                "soc_upfront_fee", "soc_insurance", "soc_ob_fee", "soc_ob_fees_actual",
+                "soc_bgv", "soc_sms_fresh", "soc_sms_rejoiner",
+                "soc_whatsapp_fresh", "soc_whatsapp_rejoiner",
+                "soc_btl", "soc_tc_incentive", "soc_fr_count", "soc_tl_count",
+                "soc_fr_initiatives", "soc_fr_extra",
+            ],
+            "SOC Same Week Transacting": ["soc_transact_ref", "soc_transact_google", "soc_transact_affiliate", "soc_transact_ssu", "soc_transact_fr", "soc_transact_agency", "soc_transact_goldmine", "soc_transact_influencers"],
+            "SOC Spill Over FOD": ["soc_spill_fod_ref", "soc_spill_fod_google", "soc_spill_fod_affiliate", "soc_spill_fod_ssu", "soc_spill_fod_fr", "soc_spill_fod_agency", "soc_spill_fod_influencers"],
+        }
+    },
+    "Agency Channel": {
+        "passcode": "agency123",
+        "sections": {
+            "SNO Agency Cost": ["cost_agency"],
+            "SNO Agency Transacting": ["transact_agency"],
+            "SNO Agency Spillover": ["spill_fod_agency"],
+            "SNO Agency Onboarding": ["onboard_agency"],
+            "SOC Agency Cost": ["soc_agency_cost"],
+            "SOC Agency Transacting": ["soc_transact_agency"],
+            "SOC Agency Spillover": ["soc_spill_fod_agency"],
+        }
+    },
+    "Google Channel": {
+        "passcode": "google123",
+        "sections": {
+            "SNO Google Costs": ["cost_google_supper", "cost_google_extra", "cost_google_fresh_fod", "cost_google_im_app", "cost_google_im_1st", "cost_google_extra_1st"],
+            "SNO Google Transacting": ["transact_google"],
+            "SNO Google Spillover": ["spill_fod_google"],
+            "SNO Google Onboarding": ["onboard_google"],
+            "SOC Google Costs": ["soc_google_im", "soc_google_supper", "soc_google_im_sa_fod", "soc_google_sf_sa_fod", "soc_extra_im"],
+            "SOC Google Transacting": ["soc_transact_google"],
+            "SOC Google Spillover": ["soc_spill_fod_google"],
+        }
+    },
+    "Referral Channel": {
+        "passcode": "ref123",
+        "sections": {
+            "SNO Referral CPFOD": ["sno_cpfod_ref", "sno_cpfod_rb_override"],
+            "SNO Referral Cost": ["cost_rb_cpfod", "cost_rb_fod", "cost_ref_override_cpfod", "cost_ref_override_fod"],
+            "SNO Referral Transacting": ["transact_ref"],
+            "SNO Referral Spillover": ["spill_fod_ref"],
+            "SNO Referral Onboarding": ["onboard_ref"],
+            "SOC Referral CPOD": ["soc_cpod_ref"],
+            "SOC Referral Cost": ["soc_rb_cpfod"],
+            "SOC Referral Transacting": ["soc_transact_ref"],
+            "SOC Referral Spillover": ["soc_spill_fod_ref"],
+        }
+    },
+    "FR Channel": {
+        "passcode": "fr123",
+        "sections": {
+            "SNO FR": ["cost_fr_salary", "cost_fr_count", "cost_fr_tl_salary", "cost_fr_tl_count", "cost_fr_incentive"],
+            "SNO FR Transacting": ["transact_fr"],
+            "SNO FR Spillover": ["spill_fod_fr"],
+            "SNO FR Onboarding": ["onboard_fr"],
+            "SOC FR": ["soc_fr_count", "soc_tl_count", "soc_fr_initiatives", "soc_fr_extra"],
+            "SOC FR Transacting": ["soc_transact_fr"],
+            "SOC FR Spillover": ["soc_spill_fod_fr"],
+        }
+    },
+    "Influencer Channel": {
+        "passcode": "inf123",
+        "sections": {
+            "SNO Influencer Cost": ["cost_influencer_payout", "cost_inf_tl_salary", "cost_inf_tl_count"],
+            "SNO Influencer Transacting": ["transact_influencers"],
+            "SNO Influencer Spillover": ["spill_fod_influencers"],
+            "SNO Influencer Onboarding": ["onboard_influencers"],
+            "SOC Influencer Transacting": ["soc_transact_influencers"],
+            "SOC Influencer Spillover": ["soc_spill_fod_influencers"],
+        }
+    },
+    "Rejoiner & Spillover": {
+        "passcode": "rej123",
+        "sections": {
+            "SNO Rejoiner": ["sno_rejoiner"],
+            "SNO Spillover Cost": ["sno_spillover_28", "cost_spillover_28", "cost_spillover_over_28"],
+            "SNO Spillover FOD": ["spill_fod_ref", "spill_fod_google", "spill_fod_affiliate", "spill_fod_ssu", "spill_fod_fr", "spill_fod_agency", "spill_fod_influencers"],
+            "SOC Rejoiner": ["soc_rejoiner", "soc_rejoiner_cost"],
+            "SOC Spillover Cost": ["soc_spillover_28", "soc_spillover_over_28", "soc_cost_spillover_28", "soc_cost_spillover_over_28"],
+            "SOC Spillover FOD": ["soc_spill_fod_ref", "soc_spill_fod_google", "soc_spill_fod_affiliate", "soc_spill_fod_ssu", "soc_spill_fod_fr", "soc_spill_fod_agency", "soc_spill_fod_influencers"],
+        }
+    },
+    "Comms Channel": {
+        "passcode": "comms123",
+        "sections": {
+            "SNO SMS": ["cost_sms_fresh", "cost_sms_rejoiner"],
+            "SNO WhatsApp": ["cost_whatsapp_fresh", "cost_whatsapp_rejoiner"],
+            "SNO OBE/RTC": ["cost_obe_rtc"],
+            "SNO Autodialer": ["cost_autodialer"],
+            "SNO BGV Fresh": ["cost_bgv_fresh", "cost_bgv_address"],
+            "SNO BGV Rejoiner": ["cost_bgv_rejoiner"],
+            "SNO Misc": ["cost_apsflyer", "cost_pivot_roots", "cost_btl"],
+            "SOC SMS": ["soc_sms_fresh", "soc_sms_rejoiner"],
+            "SOC WhatsApp": ["soc_whatsapp_fresh", "soc_whatsapp_rejoiner"],
+            "SOC BGV": ["soc_bgv"],
+            "SOC TC Incentive": ["soc_tc_incentive"],
+            "SOC BTL": ["soc_btl"],
+        }
+    },
 }
 
+USERS = {}
+for cn, cd in CHANNELS.items():
+    USERS[cn] = {"hash": hashlib.sha256(cd["passcode"].encode()).hexdigest()[:12], "admin": False}
+USERS["Tulika"] = {"hash": hashlib.sha256("admin123".encode()).hexdigest()[:12], "admin": True}
+
+METRIC_LABELS = {}
+ALL_METRICS_SET = set()
+for cd in CHANNELS.values():
+    for keys in cd["sections"].values():
+        for k in keys:
+            ALL_METRICS_SET.add(k)
+            if k not in METRIC_LABELS:
+                METRIC_LABELS[k] = k.replace("_", " ").title()
+
 def chk(raw): return hashlib.sha256(raw.encode()).hexdigest()[:12]
-def wk(dt): return f"WK{dt.isocalendar()[1]}-{dt.year}"
-def cur_mon(): return datetime.now() - timedelta(days=datetime.now().weekday())
+def wkl(dt): return f"WK{dt.isocalendar()[1]}-{dt.year}"
+def cur_ws(): return datetime.now() - timedelta(days=datetime.now().weekday())
 
-# ── Metrics ──
-METRICS = [
-    ("Orders", "SOC Order Count", "orders_soc"),
-    ("Orders", "SNO Order Count", "orders_sno"),
-    ("SNO Hiring", "Spillover (>28 days)", "sno_spillover_28"),
-    ("SNO Hiring", "CPFOD SW+Spillover - Referral", "sno_cpfod_ref"),
-    ("SNO Hiring", "CPFOD SW+Spillover - RB Override", "sno_cpfod_rb_override"),
-    ("SNO Hiring", "CPFOD SW+Spillover - Agency", "sno_cpfod_agency"),
-    ("SNO Hiring", "Rejoiner/Activation Count", "sno_rejoiner"),
-    ("SNO Cost", "Flatpay (w/o Leakage)", "cost_flatpay"),
-    ("SNO Cost", "Leakage", "cost_leakage"),
-    ("SNO Cost", "Shouldering", "cost_shouldering"),
-    ("SNO Cost", "Dormant RB", "cost_dormant_rb"),
-    ("SNO Cost", "Impersonation", "cost_impersonation"),
-    ("SNO Cost", "JB Cost", "cost_jb"),
-    ("SNO Cost", "RB Cost - SW CPFOD", "cost_rb_cpfod"),
-    ("SNO Cost", "RB Cost - SW FOD", "cost_rb_fod"),
-    ("SNO Cost", "Ref Override - SW CPFOD", "cost_ref_override_cpfod"),
-    ("SNO Cost", "Ref Override - SW FOD", "cost_ref_override_fod"),
-    ("SNO Cost", "Spillover <=28 Days Cost", "cost_spillover_28"),
-    ("SNO Cost", "Agency Cost", "cost_agency"),
-    ("SNO Cost", "Google Supper App Cost", "cost_google_supper"),
-    ("SNO Cost", "Google Extra Cost", "cost_google_extra"),
-    ("SNO Cost", "Google Supper App Fresh FOD", "cost_google_fresh_fod"),
-    ("SNO Cost", "Google IM App Cost", "cost_google_im_app"),
-    ("SNO Cost", "Google SNO IM 1st Party", "cost_google_im_1st"),
-    ("SNO Cost", "Google Extra 1st Party", "cost_google_extra_1st"),
-    ("SNO Cost", "Upfront Fee Collection", "cost_upfront_fee"),
-    ("SNO Cost", "Insurance", "cost_insurance"),
-    ("SNO Cost", "OB Fee Collection", "cost_ob_fee"),
-    ("SNO Cost", "Apsflyer Portal", "cost_apsflyer"),
-    ("SNO Cost", "Pivot Roots", "cost_pivot_roots"),
-    ("SNO Cost", "Autodialer Cost", "cost_autodialer"),
-    ("SNO Cost", "BGV Fresh - Betterplace+Authbridge", "cost_bgv_fresh"),
-    ("SNO Cost", "BGV Fresh - Address Check", "cost_bgv_address"),
-    ("SNO Cost", "BGV Rejoiner", "cost_bgv_rejoiner"),
-    ("SNO Cost", "SMS Cost Fresh", "cost_sms_fresh"),
-    ("SNO Cost", "SMS Cost Rejoiner", "cost_sms_rejoiner"),
-    ("SNO Cost", "Whatsapp Comms Fresh", "cost_whatsapp_fresh"),
-    ("SNO Cost", "Whatsapp Comms Rejoiner", "cost_whatsapp_rejoiner"),
-    ("SNO Cost", "OBE/RTC Incentive", "cost_obe_rtc"),
-    ("SNO Cost", "FR Salary", "cost_fr_salary"),
-    ("SNO Cost", "FR Count", "cost_fr_count"),
-    ("SNO Cost", "FR TL Salary", "cost_fr_tl_salary"),
-    ("SNO Cost", "FR TL Count", "cost_fr_tl_count"),
-    ("SNO Cost", "BTL Spend", "cost_btl"),
-    ("SNO Cost", "FR+FR TL Incentive", "cost_fr_incentive"),
-    ("SNO Cost", "Influencer Payout", "cost_influencer_payout"),
-    ("SNO Cost", "Influencer TL Salary", "cost_inf_tl_salary"),
-    ("SNO Cost", "Influencer TL Count", "cost_inf_tl_count"),
-    ("SNO Cost", "Spillover >28 Days", "cost_spillover_over_28"),
-    ("SNO Cost", "Other Cost", "cost_other_mult"),
-    ("SNO Same Week Transacting", "Referral", "transact_ref"),
-    ("SNO Same Week Transacting", "Google", "transact_google"),
-    ("SNO Same Week Transacting", "Affiliate", "transact_affiliate"),
-    ("SNO Same Week Transacting", "SSU Direct", "transact_ssu"),
-    ("SNO Same Week Transacting", "FR", "transact_fr"),
-    ("SNO Same Week Transacting", "Agency", "transact_agency"),
-    ("SNO Same Week Transacting", "Influencers", "transact_influencers"),
-    ("SNO Spill Over FOD", "Referral", "spill_fod_ref"),
-    ("SNO Spill Over FOD", "Google", "spill_fod_google"),
-    ("SNO Spill Over FOD", "Affiliate", "spill_fod_affiliate"),
-    ("SNO Spill Over FOD", "SSU Direct", "spill_fod_ssu"),
-    ("SNO Spill Over FOD", "FR", "spill_fod_fr"),
-    ("SNO Spill Over FOD", "Agency", "spill_fod_agency"),
-    ("SNO Spill Over FOD", "Influencers", "spill_fod_influencers"),
-    ("SNO Onboarding", "Referral", "onboard_ref"),
-    ("SNO Onboarding", "Google", "onboard_google"),
-    ("SNO Onboarding", "Affiliate", "onboard_affiliate"),
-    ("SNO Onboarding", "SSU Direct", "onboard_ssu"),
-    ("SNO Onboarding", "FR", "onboard_fr"),
-    ("SNO Onboarding", "Agency", "onboard_agency"),
-    ("SNO Onboarding", "Influencers", "onboard_influencers"),
-    ("SOC Hiring", "Fresh Onboarding", "soc_fresh_onboard"),
-    ("SOC Hiring", "SOC Rejoiner Count", "soc_rejoiner"),
-    ("SOC Hiring", "Spillover (<28 days)", "soc_spillover_28"),
-    ("SOC Hiring", "Spillover (>28 days)", "soc_spillover_over_28"),
-    ("SOC CPH", "Referral CPOD", "soc_cpod_ref"),
-    ("SOC Cost", "SOC Rejoiner Cost", "soc_rejoiner_cost"),
-    ("SOC Cost", "JB Cost", "soc_jb_cost"),
-    ("SOC Cost", "RB Cost - SW CPFOD", "soc_rb_cpfod"),
-    ("SOC Cost", "Spillover <=28 Days", "soc_cost_spillover_28"),
-    ("SOC Cost", "Spillover >28 Days", "soc_cost_spillover_over_28"),
-    ("SOC Cost", "JB Adjustment", "soc_jb_adjust"),
-    ("SOC Cost", "RB Adjustment", "soc_rb_adjust"),
-    ("SOC Cost", "Agency Cost", "soc_agency_cost"),
-    ("SOC Cost", "Google IM App Weekly", "soc_google_im"),
-    ("SOC Cost", "Google Supper App", "soc_google_supper"),
-    ("SOC Cost", "Google IM SA FOD", "soc_google_im_sa_fod"),
-    ("SOC Cost", "Google SF SA FOD", "soc_google_sf_sa_fod"),
-    ("SOC Cost", "Extra SOC IM App", "soc_extra_im"),
-    ("SOC Cost", "Upfront Fee", "soc_upfront_fee"),
-    ("SOC Cost", "Insurance", "soc_insurance"),
-    ("SOC Cost", "OB Fee", "soc_ob_fee"),
-    ("SOC Cost", "SOC OB Fees", "soc_ob_fees_actual"),
-    ("SOC Cost", "BGV Cost", "soc_bgv"),
-    ("SOC Cost", "SMS Fresh", "soc_sms_fresh"),
-    ("SOC Cost", "SMS Rejoiner", "soc_sms_rejoiner"),
-    ("SOC Cost", "Whatsapp Fresh", "soc_whatsapp_fresh"),
-    ("SOC Cost", "Whatsapp Rejoiner", "soc_whatsapp_rejoiner"),
-    ("SOC Cost", "BTL Spend", "soc_btl"),
-    ("SOC Cost", "TC Incentive", "soc_tc_incentive"),
-    ("SOC Cost", "IM FR Count", "soc_fr_count"),
-    ("SOC Cost", "IM TL Count", "soc_tl_count"),
-    ("SOC Cost", "FR Initiatives", "soc_fr_initiatives"),
-    ("SOC Cost", "FR Cost Extra", "soc_fr_extra"),
-    ("SOC Same Week Transacting", "Referral", "soc_transact_ref"),
-    ("SOC Same Week Transacting", "Google", "soc_transact_google"),
-    ("SOC Same Week Transacting", "Affiliate", "soc_transact_affiliate"),
-    ("SOC Same Week Transacting", "SSU Direct", "soc_transact_ssu"),
-    ("SOC Same Week Transacting", "FR", "soc_transact_fr"),
-    ("SOC Same Week Transacting", "Agency", "soc_transact_agency"),
-    ("SOC Same Week Transacting", "Goldmine", "soc_transact_goldmine"),
-    ("SOC Same Week Transacting", "Influencers", "soc_transact_influencers"),
-    ("SOC Spill Over FOD", "Referral", "soc_spill_fod_ref"),
-    ("SOC Spill Over FOD", "Google", "soc_spill_fod_google"),
-    ("SOC Spill Over FOD", "Affiliate", "soc_spill_fod_affiliate"),
-    ("SOC Spill Over FOD", "SSU Direct", "soc_spill_fod_ssu"),
-    ("SOC Spill Over FOD", "FR", "soc_spill_fod_fr"),
-    ("SOC Spill Over FOD", "Agency", "soc_spill_fod_agency"),
-    ("SOC Spill Over FOD", "Influencers", "soc_spill_fod_influencers"),
-]
-
-# ── Cache ──
-@st.cache_resource
-def store():
-    return {"subs": [], "targets": []}
-
-# ── UI Config ──
+# ── UI ──
 st.set_page_config(page_title="SNO Hiring Cost Tracker", layout="wide")
-st.markdown("""
-<style>
-.metric-card{background:#f0f2f6;border-radius:10px;padding:20px;text-align:center}
-.metric-value{font-size:28px;font-weight:bold;color:#1f77b4}
-.metric-label{font-size:14px;color:#666}
-</style>""", unsafe_allow_html=True)
+st.markdown("<style>.metric-card{background:#f0f2f6;border-radius:10px;padding:20px;text-align:center}.metric-value{font-size:28px;font-weight:bold;color:#1f77b4}.metric-label{font-size:14px;color:#666}</style>", unsafe_allow_html=True)
 
 for k in ["logged_in", "user", "is_admin"]:
     if k not in st.session_state:
         st.session_state[k] = None if k == "user" else False
 
-# ── Login ──
 def login_page():
     st.title("SNO Hiring Cost Tracker")
-    _, c, _ = st.columns([1,2,1])
+    _, c, _ = st.columns([1, 2, 1])
     with c:
         st.markdown("### Login")
         n = st.text_input("Name")
@@ -181,148 +414,213 @@ def login_page():
                 st.rerun()
             else:
                 st.error("Invalid credentials")
-        st.markdown("---")
-        st.markdown("- **Admin:** Tulika / admin123\n- **Channels:** SOC/soc123, SNO/sno123, Agency/agency123, etc.")
+        st.markdown("---\n**Admin:** Tulika / admin123")
+        with st.expander("Channel Logins"):
+            for cn, cd in CHANNELS.items():
+                st.text(f"{cn}: {cd['passcode']}")
 
-# ── Submission ──
 def submission_form():
-    S = store()
-    st.title("Weekly Data Submission")
-    st.markdown(f"**User:** {st.session_state.user['name']}")
+    cn = st.session_state.user["name"]
+    cd = CHANNELS.get(cn)
+    st.title(f"{cn} — Weekly Submission")
     if st.button("Logout"):
-        for k in ["logged_in", "user", "is_admin"]: st.session_state[k] = None if k == "user" else False
+        for k in ["logged_in", "user", "is_admin"]:
+            st.session_state[k] = None if k == "user" else False
         st.rerun()
-    ws = cur_mon(); wl = wk(ws)
-    st.markdown(f"### {wl} ({ws.strftime('%d %b %Y')})")
-    sections = {}
-    for s, l, k in METRICS: sections.setdefault(s, []).append((l, k))
-    with st.form("f"):
-        data = {}
-        for sec, items in sections.items():
-            with st.expander(sec, expanded=False):
-                cs = st.columns(3)
-                for i, (l, k) in enumerate(items):
-                    with cs[i%3]:
-                        data[k] = st.text_input(l, placeholder="0", key=f"x_{k}")
-        if st.form_submit_button("Submit", type="primary", use_container_width=True):
-            ch = st.session_state.user["name"]
-            S["subs"] = [s for s in S["subs"] if not (s["channel"]==ch and s["week_label"]==wl)]
-            for k, v in data.items():
-                try: val = float(v.strip().replace(",","")) if v and v.strip() else 0.0
-                except: val = 0.0
-                S["subs"].append({"channel":ch,"week_label":wl,"metric":k,"value":val,"at":datetime.now().isoformat()})
-            st.success(f"Submitted for {wl}!"); st.balloons()
-    with st.expander("My Past Submissions"):
-        ws2 = sorted(set(s["week_label"] for s in S["subs"] if s["channel"]==st.session_state.user["name"]), reverse=True)
-        if ws2:
-            for w in ws2[:10]: st.text(w)
-        else: st.info("No submissions yet")
 
-# ── Admin ──
+    wsd = cur_ws(); wl = wkl(wsd)
+    st.markdown(f"### {wl} ({wsd.strftime('%d %b %Y')})")
+    if cd is None: st.error("Channel not found."); return
+
+    with st.form("cf"):
+        data = {}
+        for sec, keys in cd["sections"].items():
+            with st.expander(f"{sec}", expanded=False):
+                cols = st.columns(3)
+                for i, mk in enumerate(keys):
+                    label = METRIC_LABELS.get(mk, mk.replace("_", " ").title())
+                    with cols[i % 3]:
+                        data[mk] = st.text_input(label, placeholder="0", key=f"f_{mk}")
+        if st.form_submit_button("Submit", type="primary", use_container_width=True):
+            clean = {}
+            for k, v in data.items():
+                raw = v.strip().replace(",", "") if v else ""
+                try: clean[k] = float(raw) if raw else 0.0
+                except: clean[k] = 0.0
+            if write_submission(cn, wl, clean):
+                st.success(f"Submitted!"); st.balloons()
+            else:
+                st.error("Save failed.")
+    with st.expander("My Past Submissions"):
+        subs = read_all_submissions()
+        mw = sorted(set(s["week_label"] for s in subs if s["channel"] == cn), reverse=True)
+        for w in mw[:10]: st.text(w)
+        if not mw: st.info("No submissions yet.")
+
 def admin_dashboard():
-    S = store(); subs = S["subs"]
     st.title("Admin Dashboard — SNO Hiring Cost")
     if st.button("Logout"):
-        for k in ["logged_in", "user", "is_admin"]: st.session_state[k] = None if k == "user" else False
+        for k in ["logged_in", "user", "is_admin"]:
+            st.session_state[k] = None if k == "user" else False
         st.rerun()
-    if not subs: st.warning("No data yet. Channel owners need to submit first."); return
 
-    t1, t2, t3, t4 = st.tabs(["All Submissions", "WoW", "CPFOD", "Users"])
+    # ── AUTO ORDER FETCH ──
+    d1, d2 = get_last_week_dates()
+    dw = datetime.strptime(d1, "%Y-%m-%d")
+    wl = wkl(dw)
+    st.markdown("---")
+    st.subheader("Auto-Fetch Orders from Snowflake")
+    cf1, cf2, cf3 = st.columns([2, 1, 1])
+    cf1.markdown(f"**Last Week:** {d1} → {d2} ({wl})")
+    if cf2.button("Fetch Orders", use_container_width=True, type="primary"):
+        with st.spinner("Querying Snowflake..."):
+            orders = fetch_orders_from_snowflake(d1, d2)
+            if orders:
+                st.session_state["fo"] = orders
+                st.session_state["fow"] = wl
+                st.success("Fetched!")
+                st.rerun()
+            else:
+                st.error("Query failed.")
+    if cf3.button("Save to Sheet", use_container_width=True):
+        if "fo" in st.session_state:
+            if write_orders_to_sheet(st.session_state["fow"], st.session_state["fo"]):
+                st.success("Saved to Google Sheet!")
+                st.rerun()
+            else:
+                st.error("Save failed.")
+        else:
+            st.warning("Fetch first!")
+
+    if "fo" in st.session_state:
+        fo = st.session_state["fo"]
+        cols = st.columns(4)
+        for i, (l, v) in enumerate([("SNO Food", fo.get("SNO_Food", 0)), ("SNO IM", fo.get("SNO_IM", 0)),
+                                      ("SOC Food", fo.get("SOC_Food", 0)), ("SOC IM", fo.get("SOC_IM", 0))]):
+            with cols[i]:
+                st.markdown(f'<div class="metric-card"><div class="metric-label">{l}</div><div class="metric-value">{v:,}</div></div>', unsafe_allow_html=True)
+        st.markdown(f"**SNO Total:** {fo.get('SNO_Total',0):,} | **SOC Total:** {fo.get('SOC_Total',0):,}")
+
+    st.markdown("---")
+
+    subs = read_all_submissions()
+    if not subs:
+        st.warning("No data yet.")
+        ws = get_sheet()
+        if ws: st.success(f"Sheet: `{ws.title}`")
+        else: st.error("Google Sheets not connected. Add `gcp_service_account` to secrets.")
+        return
+
+    ws = get_sheet()
+    if ws: st.success(f"Sheet: `{ws.title}` | {len(subs)} data points")
+
+    t1, t2, t3, t4 = st.tabs(["Submissions", "WoW", "CPFOD", "Channels"])
+
+    ck = ["cost_flatpay", "cost_leakage", "cost_shouldering", "cost_jb", "cost_agency",
+          "cost_google_supper", "cost_google_im_app", "cost_insurance", "cost_ob_fee",
+          "cost_bgv_fresh", "cost_sms_fresh", "cost_whatsapp_fresh",
+          "cost_fr_salary", "cost_fr_tl_salary", "cost_btl", "cost_fr_incentive",
+          "cost_influencer_payout", "cost_inf_tl_salary"]
+    fk = ["transact_ref", "transact_google", "transact_ssu", "transact_fr",
+          "transact_agency", "transact_influencers"]
+
+    def gm(wk):
+        return {s["metric"]: sum(s2["value"] for s2 in subs if s2["week_label"] == wk and s2["metric"] == s["metric"])
+                for s in subs if s["week_label"] == wk}
 
     with t1:
-        st.subheader("Weekly Submissions")
         weeks = sorted(set(s["week_label"] for s in subs), reverse=True)
-        sw = st.selectbox("Week", weeks, key="t1w")
-        chd = {}
-        for s in subs:
-            if s["week_label"]==sw:
-                chd.setdefault(s["channel"],{})[s["metric"]]=s["value"]
-        for ch, d in chd.items():
+        sw = st.selectbox("Week", weeks)
+        st.markdown(f"### {sw}")
+        for ch in sorted(set(s["channel"] for s in subs if s["week_label"] == sw)):
             with st.expander(ch):
-                rows = [(k.replace("_"," ").title(),v) for k,v in d.items() if v!=0]
-                if rows: st.dataframe(pd.DataFrame(rows,columns=["Metric","Value"]), use_container_width=True, hide_index=True)
+                rows = [(METRIC_LABELS.get(s["metric"], s["metric"]), s["value"])
+                        for s in subs if s["week_label"] == sw and s["channel"] == ch]
+                if rows:
+                    st.dataframe(pd.DataFrame(rows, columns=["Metric", "Value"]), use_container_width=True, hide_index=True)
         if st.button("Download Excel", use_container_width=True):
-            from io import BytesIO; o=BytesIO()
-            records=[];we2=sorted(set(s["week_label"] for s in subs))
-            for mk in [m[2] for m in METRICS]:
-                ml=next((m[1] for m in METRICS if m[2]==mk),mk);row={"Metric":ml}
-                for w in we2: row[w]=sum(s["value"] for s in subs if s["week_label"]==w and s["metric"]==mk)
-                records.append(row)
-            with pd.ExcelWriter(o,engine="openpyxl") as wb:
-                pd.DataFrame(records).to_excel(wb,sheet_name="Data",index=False)
-                ck=["cost_flatpay","cost_leakage","cost_shouldering","cost_jb","cost_agency","cost_google_supper","cost_google_im_app","cost_insurance","cost_ob_fee"]
-                fk=["transact_ref","transact_google","transact_ssu","transact_fr","transact_agency","transact_influencers"]
-                smm=[]
-                for w in we2:
-                    d={}
-                    for s in subs:
-                        if s["week_label"]==w:d[s["metric"]]=d.get(s["metric"],0)+(s["value"]or 0)
-                    smm.append({"Week":w,"Cost":sum(d.get(k,0) for k in ck),"FOD":int(sum(d.get(k,0) for k in fk)),"CPFOD":round(sum(d.get(k,0) for k in ck)/max(sum(d.get(k,0) for k in fk),1))})
-                pd.DataFrame(smm).to_excel(wb,sheet_name="Summary",index=False)
-            o.seek(0);st.download_button("Download",o,"sno_data.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            from io import BytesIO
+            o = BytesIO()
+            aw = sorted(set(s["week_label"] for s in subs))
+            with pd.ExcelWriter(o, engine="openpyxl") as wb:
+                rd = []
+                for mk in sorted(ALL_METRICS_SET):
+                    row = {"Metric": METRIC_LABELS.get(mk, mk)}
+                    for w in aw:
+                        row[w] = sum(s["value"] for s in subs if s["week_label"] == w and s["metric"] == mk)
+                    rd.append(row)
+                pd.DataFrame(rd).to_excel(wb, sheet_name="Data", index=False)
+                sm = []
+                for w in aw:
+                    d = gm(w)
+                    sm.append({"Week": w, "Cost": sum(d.get(k, 0) for k in ck),
+                              "FOD": int(sum(d.get(k, 0) for k in fk)),
+                              "CPFOD": round(sum(d.get(k, 0) for k in ck) / max(sum(d.get(k, 0) for k in fk), 1))})
+                pd.DataFrame(sm).to_excel(wb, sheet_name="Summary", index=False)
+            o.seek(0)
+            st.download_button("Download", o, "sno_data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     with t2:
-        st.subheader("WoW Summary")
         wa = sorted(set(s["week_label"] for s in subs), reverse=True)
-        if len(wa)>=2:
-            tw,pw=wa[0],wa[1]
-            def gm(wk):
-                m={}
-                for s in subs:
-                    if s["week_label"]==wk:m[s["metric"]]=m.get(s["metric"],0)+(s["value"]or 0)
-                return m
-            d1,d2=gm(tw),gm(pw)
-            ck=["cost_flatpay","cost_leakage","cost_shouldering","cost_jb","cost_agency","cost_google_supper","cost_google_im_app","cost_insurance","cost_ob_fee","cost_bgv_fresh","cost_sms_fresh","cost_whatsapp_fresh","cost_fr_salary","cost_fr_tl_salary","cost_btl","cost_fr_incentive","cost_influencer_payout","cost_inf_tl_salary"]
-            fk=["transact_ref","transact_google","transact_ssu","transact_fr","transact_agency","transact_influencers"]
-            c1,c2=sum(d1.get(k,0) for k in ck),sum(d2.get(k,0) for k in ck)
-            f1,f2=sum(d1.get(k,0) for k in fk),sum(d2.get(k,0) for k in fk)
-            cp1,cp2=round(c1/max(f1,1)),round(c2/max(f2,1))
-            cols=st.columns(4)
-            for i,(l,v1,v2) in enumerate([("Total Cost",c1,c2),("Total FOD",f1,f2),("CPFOD",cp1,cp2),("Cost Change",c1-c2,None)]):
+        if len(wa) >= 2:
+            tw, pw = wa[0], wa[1]
+            d1_, d2_ = gm(tw), gm(pw)
+            c1, c2 = sum(d1_.get(k, 0) for k in ck), sum(d2_.get(k, 0) for k in ck)
+            f1, f2 = sum(d1_.get(k, 0) for k in fk), sum(d2_.get(k, 0) for k in fk)
+            cp1, cp2 = round(c1 / max(f1, 1)), round(c2 / max(f2, 1))
+            cards = [("Total Cost", c1, c2), ("Total FOD", f1, f2), ("CPFOD", cp1, cp2), ("Cost WoW", c1 - c2, None)]
+            cols = st.columns(4)
+            for i, (l, v, pv) in enumerate(cards):
                 with cols[i]:
-                    d=v1-v2 if v2 else 0
-                    p=f" ({(d/v2*100):+.1f}%)" if v2 else ""
-                    cl="#d32f2f" if d>0 else "#388e3c" if d<0 else "#666"
-                    st.markdown(f'<div class="metric-card"><div class="metric-label">{l}</div><div class="metric-value">{v1:,.0f}</div><div style="color:{cl}">{d:+,.0f}{p}</div></div>',unsafe_allow_html=True)
-            trend=[]
+                    dlt = v - pv if pv else 0
+                    pct = f" ({dlt/pv*100:+.1f}%)" if pv and pv != 0 else ""
+                    clr = "#d32f2f" if dlt > 0 else "#388e3c" if dlt < 0 else "#666"
+                    st.markdown(f'<div class="metric-card"><div class="metric-label">{l}</div><div class="metric-value">{v:,.0f}</div><div style="color:{clr}">{dlt:+,.0f}{pct}</div></div>', unsafe_allow_html=True)
+            trend = []
             for wk in sorted(set(s["week_label"] for s in subs)):
-                d=gm(wk)
-                trend.append({"Week":wk,"Cost (L)":round(sum(d.get(k,0) for k in ck)/100000,2),"CPFOD":round(sum(d.get(k,0) for k in ck)/max(sum(d.get(k,0) for k in fk),1))})
-            df_t=pd.DataFrame(trend)
-            ca,cb=st.columns(2)
-            ca.plotly_chart(px.line(df_t,x="Week",y="Cost (L)",markers=True,title="Cost Trend"),use_container_width=True)
-            cb.plotly_chart(px.line(df_t,x="Week",y="CPFOD",markers=True,title="CPFOD Trend"),use_container_width=True)
-        else: st.info("Need 2+ weeks")
+                d = gm(wk)
+                trend.append({"Week": wk, "Cost (L)": round(sum(d.get(k, 0) for k in ck) / 100000, 2),
+                             "CPFOD": round(sum(d.get(k, 0) for k in ck) / max(sum(d.get(k, 0) for k in fk), 1))})
+            df_t = pd.DataFrame(trend)
+            ca, cb = st.columns(2)
+            ca.plotly_chart(px.line(df_t, x="Week", y="Cost (L)", markers=True, title="Cost Trend"), use_container_width=True)
+            cb.plotly_chart(px.line(df_t, x="Week", y="CPFOD", markers=True, title="CPFOD Trend"), use_container_width=True)
+        else:
+            st.info("Need 2+ weeks.")
 
     with t3:
-        st.subheader("CPFOD Analysis")
-        wa=sorted(set(s["week_label"] for s in subs),reverse=True)
-        if len(wa)>=2:
-            c1,c2=st.columns(2)
-            w1=c1.selectbox("Base",wa,index=0,key="co1")
-            rest=[w for w in wa if w!=w1]
-            w2=c2.selectbox("Compare",rest,index=0,key="co2") if rest else None
+        wa = sorted(set(s["week_label"] for s in subs), reverse=True)
+        if len(wa) >= 2:
+            ca, cb = st.columns(2)
+            w1 = ca.selectbox("Base", wa, index=0, key="cp1")
+            rest = [w for w in wa if w != w1]
+            w2 = cb.selectbox("Compare", rest, index=0, key="cp2") if rest else None
             if w2:
-                d1,d2=gm(w1),gm(w2)
-                chs=["Referral","Google","Agency","FR","SSU Direct"]
-                ks=["transact_ref","transact_google","transact_agency","transact_fr","transact_ssu"]
-                analysis=[]
-                for ch,k in zip(chs,ks):
-                    f1v,f2v=d1.get(k,0),d2.get(k,0)
-                    analysis.append({"Channel":ch,f"FOD {w1}":int(f1v),f"FOD {w2}":int(f2v),"Delta":int(f2v-f1v)})
-                st.dataframe(pd.DataFrame(analysis),use_container_width=True,hide_index=True)
-        else: st.info("Need 2+ weeks")
+                da, db = gm(w1), gm(w2)
+                analysis = []
+                for ch, key in zip(["Referral", "Google", "Agency", "FR", "SSU Direct"],
+                                   ["transact_ref", "transact_google", "transact_agency", "transact_fr", "transact_ssu"]):
+                    analysis.append({"Channel": ch, f"FOD {w1}": int(da.get(key, 0)),
+                                    f"FOD {w2}": int(db.get(key, 0)),
+                                    "Delta": int(db.get(key, 0) - da.get(key, 0))})
+                st.dataframe(pd.DataFrame(analysis), use_container_width=True, hide_index=True)
+        else:
+            st.info("Need 2+ weeks.")
 
     with t4:
-        st.subheader("Users")
-        for n,i in USERS.items():
-            st.text(f"- {n} ({'Admin' if i['admin'] else 'Channel'})")
-        st.info("To modify users, update the app code or contact developer.")
+        st.subheader("Channel Owners")
+        for cn_, cd_ in CHANNELS.items():
+            with st.expander(f"{cn_} (pw: {cd_['passcode']})"):
+                for sec, keys in cd_["sections"].items():
+                    st.text(f"  {sec}: {len(keys)} metrics")
 
-# ── Main ──
 def main():
-    if not st.session_state.logged_in: login_page()
-    elif st.session_state.is_admin: admin_dashboard()
-    else: submission_form()
+    if not st.session_state.logged_in:
+        login_page()
+    elif st.session_state.is_admin:
+        admin_dashboard()
+    else:
+        submission_form()
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
