@@ -2,3 +2,6 @@ streamlit
 pandas
 plotly
 openpyxl
+gspread
+oauth2client
+snowflake-connector-python
